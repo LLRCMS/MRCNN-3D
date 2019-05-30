@@ -62,3 +62,76 @@ def test_compute_overlaps_3D():
 
   assert np.all(overlaps[0, :] == iou_box1)
   assert np.all(overlaps[1, :] == iou_box2)
+
+def make_mask_3D(size, bb_coord):
+    """ make mask of size `size` and put a bb at coordinate bb_coord """
+    mask = np.zeros(size)
+    z1, y1, x1, z2, y2, x2 = bb_coord
+    mask[z1:z2, y1:y2, x1:x2] = 1
+    return mask
+
+def test_extract_bboxes_3D():
+  size = (4, 4, 4)
+
+  coord1 = (0, 0, 0, 2, 2, 2)
+  coord2 = (0, 2, 0, 1, 4, 2)
+  coord3 = (1, 2, 0, 2, 4, 2)
+  
+  mask1 = make_mask_3D(size, coord1)
+  mask2 = make_mask_3D(size, coord2)
+  mask3 = make_mask_3D(size, coord3)
+
+  # stack the masks along the last axe
+  masks = np.stack([mask1, mask2, mask3], axis = -1)
+
+  boxes = utils.extract_bboxes_3D(masks)
+
+  assert np.all([list(x) for x in (coord1, coord2, coord3)] == boxes)
+
+def test_resize_image_3D():
+  # open test 3D MNIST file
+  f = h5py.File('../test_img/test_3d_mnist_4.hdf5', 'r')
+  x4 = np.array(f['3d_mnist_4'])
+  # reshape it to cube (it is flattened in the file)
+  x4 = x4.reshape((16,16,16))
+  x4_cropped = x4[:12, ...]
+
+  x4_resized, window, scale, padding, crop  = utils.resize_image_3D(x4, min_dim=28, max_dim=28)
+  x4_cropped_resized, window_cropped, scale_cropped, padding_cropped, crop_cropped  = utils.resize_image_3D(x4_cropped, min_dim=28, max_dim=28)
+
+  assert x4_resized.shape == (28, 28, 28)
+  assert x4_cropped_resized.shape == (28, 28, 28)
+
+  assert window == (0, 0, 0, 28, 28, 28)
+  assert window_cropped == (3, 0, 0, 24, 28, 28)
+
+  assert np.all(padding == [(0,0), (0,0), (0,0)])
+  assert np.all(padding_cropped == [(3,4), (0,0), (0,0)])
+
+  assert scale == 1.75
+  assert scale_cropped == 1.75
+
+def test_resize_mask_3D():
+  # TODO: take care of size of mask (fourth dim) and padding
+  size = (4, 4, 4)
+  coord1 = (0, 0, 0, 2, 2, 2)
+  coord2 = (0, 2, 0, 1, 4, 2)
+  coord3 = (1, 2, 0, 2, 4, 2)
+
+  mask1 = make_mask_3D(size, coord1)
+  mask2 = make_mask_3D(size, coord2)
+  mask3 = make_mask_3D(size, coord3)
+
+  masks = np.stack([mask1, mask2, mask3], axis = -1)
+  padding =  [(1,2), (3,4), (5,6)]
+
+  masks_resized = utils.resize_mask_3D(masks, 1.25, padding)
+
+  assert masks_resized.shape == (8, 12, 16, 3)
+
+  # resize_mask_3D only works with stack of masks, tensor of rank 4
+  with pytest.raises(RuntimeError) as e_info:
+    masks_resized = utils.resize_mask_3D(mask1, 1.25, padding)
+
+  error_message = "sequence argument must have length equal to input rank"
+  assert error_message in str(e_info.value)

@@ -56,6 +56,33 @@ def extract_bboxes(mask):
         boxes[i] = np.array([y1, x1, y2, x2])
     return boxes.astype(np.int32)
 
+def extract_bboxes_3D(mask):
+    """Compute bounding boxes from masks.
+    mask: [depth, height, width, num_instances]. Mask pixels are either 1 or 0.
+
+    Returns: bbox array [num_instances, (z1, y1, x1, z2, y2, x2)].
+    """
+    boxes = np.zeros([mask.shape[-1], 6], dtype=np.int32)
+    for i in range(mask.shape[-1]):
+        m = mask[..., i]
+        # Bounding box.
+        horizontal_indicies = np.where(np.any(m, axis=(0,1)))[0]
+        vertical_indicies = np.where(np.any(m, axis=(0,2)))[0]
+        depthical_indicies = np.where(np.any(m, axis=(1,2)))[0]
+        if horizontal_indicies.shape[0]:
+            x1, x2 = horizontal_indicies[[0, -1]]
+            y1, y2 = vertical_indicies[[0, -1]]
+            z1, z2 = depthical_indicies[[0, -1]]
+            # x2, y2 and z2 should not be part of the box. Increment by 1.
+            x2 += 1
+            y2 += 1
+            z2 += 1
+        else:
+            # No mask for this instance. Might happen due to
+            # resizing or cropping. Set bbox to zeros
+            x1, x2, y1, y2, z1, z2 = 0, 0, 0, 0, 0, 0
+        boxes[i] = np.array([z1, y1, x1, z2, y2, x2])
+    return boxes.astype(np.int32)
 
 def compute_iou(box, boxes, box_area, boxes_area):
     """Calculates IoU of the given box with the array of the given boxes.
@@ -77,6 +104,49 @@ def compute_iou(box, boxes, box_area, boxes_area):
     iou = intersection / union
     return iou
 
+def compute_iou_3D(box, boxes, box_vol, boxes_vol):
+    """Calculates IoU of the given box with the array of the given boxes.
+    box: 1D vector [z1, y1, x1, z2, y2, x2]
+    boxes: [boxes_count, (z1, y1, x1, z2, y2, x2)]
+    box_vol: float. the volume of 'box'
+    boxes_vol: array of length boxes_count.
+
+    Note: the volumes are passed in rather than calculated here for
+    efficiency. Calculate once in the caller to avoid duplicate work.
+    """
+    # Calculate intersection volumes
+    z1 = np.maximum(box[0], boxes[:, 0])
+    z2 = np.minimum(box[3], boxes[:, 3])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    y2 = np.minimum(box[4], boxes[:, 4])
+    x1 = np.maximum(box[2], boxes[:, 2])
+    x2 = np.minimum(box[5], boxes[:, 5])
+    intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0) * np.maximum(z2 - z1, 0)
+    union = box_vol + boxes_vol[:] - intersection[:]
+    iou = intersection / union
+    return iou
+
+def compute_iou_graph_3D(box, boxes, box_vol, boxes_vol):
+    """Calculates IoU of the given box with the array of the given boxes.
+    box: 1D vector [z1, y1, x1, z2, y2, x2]
+    boxes: [boxes_count, (z1, y1, x1, z2, y2, x2)]
+    box_vol: float. the volume of 'box'
+    boxes_vol: array of length boxes_count.
+
+    Note: the volumes are passed in rather than calculated here for
+    efficiency. Calculate once in the caller to avoid duplicate work.
+    """
+    # Calculate intersection volumes
+    z1 = tf.maximum(box[0], boxes[:, 0])
+    z2 = tf.minimum(box[3], boxes[:, 3])
+    y1 = tf.maximum(box[1], boxes[:, 1])
+    y2 = tf.minimum(box[4], boxes[:, 4])
+    x1 = tf.maximum(box[2], boxes[:, 2])
+    x2 = tf.minimum(box[5], boxes[:, 5])
+    intersection = tf.maximum(x2 - x1, 0) * tf.maximum(y2 - y1, 0) * tf.maximum(z2 - z1, 0)
+    union = box_vol + boxes_vol[:] - intersection[:]
+    iou = intersection / union
+    return iou
 
 def compute_overlaps(boxes1, boxes2):
     """Computes IoU overlaps between two sets of boxes.
@@ -94,6 +164,24 @@ def compute_overlaps(boxes1, boxes2):
     for i in range(overlaps.shape[1]):
         box2 = boxes2[i]
         overlaps[:, i] = compute_iou(box2, boxes1, area2[i], area1)
+    return overlaps
+
+def compute_overlaps_3D(boxes1, boxes2):
+    """Computes IoU overlaps between two sets of boxes.
+    boxes1, boxes2: [N, (z1, y1, x1, z2, y2, x2)].
+
+    For better performance, pass the largest set first and the smaller second.
+    """
+    # Volumes of anchors and GT boxes
+    vol1 = (boxes1[:, 3] - boxes1[:, 0]) * (boxes1[:, 4] - boxes1[:, 1]) * (boxes1[:, 5] - boxes1[:, 2])
+    vol2 = (boxes2[:, 3] - boxes2[:, 0]) * (boxes2[:, 4] - boxes2[:, 1]) * (boxes2[:, 5] - boxes2[:, 2])
+
+    # Compute overlaps to generate matrix [boxes1 count, boxes2 count]
+    # Each cell contains the IoU value.
+    overlaps = np.zeros((boxes1.shape[0], boxes2.shape[0]))
+    for i in range(overlaps.shape[1]):
+        box2 = boxes2[i]
+        overlaps[:, i] = compute_iou_3D(box2, boxes1, vol2[i], vol1)
     return overlaps
 
 
@@ -114,6 +202,27 @@ def compute_overlaps_masks(masks1, masks2):
     # intersections and union
     intersections = np.dot(masks1.T, masks2)
     union = area1[:, None] + area2[None, :] - intersections
+    overlaps = intersections / union
+
+    return overlaps
+
+def compute_overlaps_masks_3D(masks1, masks2):
+    """Computes IoU overlaps between two sets of masks.
+    masks1, masks2: [Depth, Height, Width, instances]
+    """
+    
+    # If either set of masks is empty return empty result
+    if masks1.shape[-1] == 0 or masks2.shape[-1] == 0:
+        return np.zeros((masks1.shape[-1], masks2.shape[-1]))
+    # flatten masks and compute their volumes
+    masks1 = np.reshape(masks1 > .5, (-1, masks1.shape[-1])).astype(np.float32)
+    masks2 = np.reshape(masks2 > .5, (-1, masks2.shape[-1])).astype(np.float32)
+    vol1 = np.sum(masks1, axis=0)
+    vol2 = np.sum(masks2, axis=0)
+
+    # intersections and union
+    intersections = np.dot(masks1.transpose(), masks2)
+    union = vol1[:, None] + vol2[None, :] - intersections
     overlaps = intersections / union
 
     return overlaps
@@ -156,6 +265,82 @@ def non_max_suppression(boxes, scores, threshold):
     return np.array(pick, dtype=np.int32)
 
 
+
+def non_max_suppression_3D(boxes, scores, threshold):
+    """Performs non-maximum suppression and returns indices of kept boxes.
+    boxes: [N, (z1, y1, x1, z2, y2, x2)]. Notice that (z2, y2, x2) lays outside the box.
+    scores: 1-D array of box scores.
+    threshold: Float. IoU threshold to use for filtering.
+    """
+    assert boxes.shape[0] > 0
+    if boxes.dtype.kind != "f":
+        boxes = boxes.astype(np.float32)
+
+    # Compute box areas
+    z1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x1 = boxes[:, 2]
+    z2 = boxes[:, 3]
+    y2 = boxes[:, 4]
+    x2 = boxes[:, 5]
+    vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
+
+    # Get indicies of boxes sorted by scores (highest first)
+    ixs = scores.argsort()[::-1]
+
+    pick = []
+    while len(ixs) > 0:
+        # Pick top box and add its index to the list
+        i = ixs[0]
+        pick.append(i)
+        # Compute IoU of the picked box with the rest
+        iou = compute_iou_3D(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+        # Identify boxes with IoU over the threshold. This
+        # returns indices into ixs[1:], so add 1 to get
+        # indices into ixs.
+        remove_ixs = np.where(iou > threshold)[0] + 1
+        # Remove indices of the picked and overlapped boxes.
+        ixs = np.delete(ixs, remove_ixs)
+        ixs = np.delete(ixs, 0)
+    return np.array(pick, dtype=np.int32)
+
+def non_max_suppression_graph_3D(boxes, scores, max_output_size, threshold):
+    """Performs non-maximum suppression and returns indices of kept boxes.
+    boxes: [N, (z1, y1, x1, z2, y2, x2)]. Notice that (z2, y2, x2) lays outside the box.
+    scores: 1-D array of box scores.
+    threshold: Float. IoU threshold to use for filtering.
+    """
+    assert boxes.shape[0] > 0
+
+    # Compute box areas
+    z1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x1 = boxes[:, 2]
+    z2 = boxes[:, 3]
+    y2 = boxes[:, 4]
+    x2 = boxes[:, 5]
+    vol = (z2 - z1) * (y2 - y1) * (x2 - x1)
+
+    # Get indicies of boxes sorted by scores (highest first)
+    ixs = tf.argsort(scores)[::-1]
+
+    pick = []
+    while len(ixs) > 0:
+        # Pick top box and add its index to the list
+        i = ixs[0]
+        pick.append(i)
+        # Compute IoU of the picked box with the rest
+        iou = compute_iou_graph_3D(boxes[i], boxes[ixs[1:]], vol[i], vol[ixs[1:]])
+        # Identify boxes with IoU over the threshold. This
+        # returns indices into ixs[1:], so add 1 to get
+        # indices into ixs.
+        remove_ixs = tf.where(iou > threshold)[0] + 1
+        # Remove indices of the picked and overlapped boxes.
+        ixs = tf.gather(ixs, remove_ixs)
+        ixs = tf.gather(ixs, 0)
+    return tf.constant(pick[:max_output_size])
+
+
 def apply_box_deltas(boxes, deltas):
     """Applies the given deltas to the given boxes.
     boxes: [N, (y1, x1, y2, x2)]. Note that (y2, x2) is outside the box.
@@ -178,6 +363,35 @@ def apply_box_deltas(boxes, deltas):
     y2 = y1 + height
     x2 = x1 + width
     return np.stack([y1, x1, y2, x2], axis=1)
+
+def apply_box_deltas_3D(boxes, deltas):
+    """Applies the given deltas to the given boxes.
+    boxes: [N, (z1, y1, x1, z2, y2, x2)]. Note that (z2, y2, x2) is outside the box.
+    deltas: [N, (dz, dy, dx, log(dd), log(dh), log(dw))]
+    """
+    boxes = boxes.astype(np.float32)
+    # Convert to z, y, x, d, h, w
+    depth = boxes[:, 3] - boxes[:, 0]
+    height = boxes[:, 4] - boxes[:, 1]
+    width = boxes[:, 5] - boxes[:, 2]
+    center_z = boxes[:, 0] + 0.5 * depth
+    center_y = boxes[:, 1] + 0.5 * height
+    center_x = boxes[:, 2] + 0.5 * width
+    # Apply deltas
+    center_z += deltas[:, 0] * depth
+    center_y += deltas[:, 1] * height
+    center_x += deltas[:, 2] * width
+    depth *= np.exp(deltas[:, 3])
+    height *= np.exp(deltas[:, 4])
+    width *= np.exp(deltas[:, 5])
+    # Convert back to z1, y1, x1, z2, y2, x2
+    z1 = center_z - 0.5 * depth
+    y1 = center_y - 0.5 * height
+    x1 = center_x - 0.5 * width
+    z2 = z1 + depth
+    y2 = y1 + height
+    x2 = x1 + width
+    return np.stack([z1, y1, x1, z2, y2, x2], axis=1)
 
 
 def box_refinement_graph(box, gt_box):
@@ -205,6 +419,37 @@ def box_refinement_graph(box, gt_box):
     result = tf.stack([dy, dx, dh, dw], axis=1)
     return result
 
+def box_refinement_graph_3D(box, gt_box):
+    """Compute refinement needed to transform box to gt_box.
+    box and gt_box are [N, (z1, y1, x1, z2, y2, x2)]
+    """
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
+
+    depth = box[:, 3] - box[:, 0]
+    height = box[:, 4] - box[:, 1]
+    width = box[:, 5] - box[:, 2]
+    center_z = box[:, 0] + 0.5 * depth
+    center_y = box[:, 1] + 0.5 * height
+    center_x = box[:, 2] + 0.5 * width
+
+    gt_depth = gt_box[:, 3] - gt_box[:, 0]
+    gt_height = gt_box[:, 4] - gt_box[:, 1]
+    gt_width = gt_box[:, 5] - gt_box[:, 2]
+    gt_center_z = gt_box[:, 0] + 0.5 * gt_depth
+    gt_center_y = gt_box[:, 1] + 0.5 * gt_height
+    gt_center_x = gt_box[:, 2] + 0.5 * gt_width
+
+    dz = (gt_center_z - center_z) / depth
+    dy = (gt_center_y - center_y) / height
+    dx = (gt_center_x - center_x) / width
+    dd = tf.log(gt_depth / depth)
+    dh = tf.log(gt_height / height)
+    dw = tf.log(gt_width / width)
+
+    result = tf.stack([dz, dy, dx, dd, dh, dw], axis=1)
+    return result
+
 
 def box_refinement(box, gt_box):
     """Compute refinement needed to transform box to gt_box.
@@ -230,6 +475,37 @@ def box_refinement(box, gt_box):
     dw = np.log(gt_width / width)
 
     return np.stack([dy, dx, dh, dw], axis=1)
+
+def box_refinement_3D(box, gt_box):
+    """Compute refinement needed to transform box to gt_box.
+    box and gt_box are [N, (z1, y1, x1, z2, y2, x2)]. (z2, y2, x2) is
+    assumed to be outside the box.
+    """
+    box = box.astype(np.float32)
+    gt_box = gt_box.astype(np.float32)
+
+    depth = box[:, 3] - box[:, 0]
+    height = box[:, 4] - box[:, 1]
+    width = box[:, 5] - box[:, 2]
+    center_z = box[:, 0] + 0.5 * depth
+    center_y = box[:, 1] + 0.5 * height
+    center_x = box[:, 2] + 0.5 * width
+
+    gt_depth = gt_box[:, 3] - gt_box[:, 0]
+    gt_height = gt_box[:, 4] - gt_box[:, 1]
+    gt_width = gt_box[:, 5] - gt_box[:, 2]
+    gt_center_z = gt_box[:, 0] + 0.5 * gt_depth
+    gt_center_y = gt_box[:, 1] + 0.5 * gt_height
+    gt_center_x = gt_box[:, 2] + 0.5 * gt_width
+
+    dz = (gt_center_z - center_z) / depth
+    dy = (gt_center_y - center_y) / height
+    dx = (gt_center_x - center_x) / width
+    dd = np.log(gt_depth / depth)
+    dh = np.log(gt_height / height)
+    dw = np.log(gt_width / width)
+
+    return np.stack([dz, dy, dx, dd, dh, dw], axis=1)
 
 
 ############################################################

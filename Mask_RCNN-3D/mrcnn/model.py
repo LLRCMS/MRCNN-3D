@@ -84,6 +84,23 @@ def compute_backbone_shapes(config, image_shape):
             int(math.ceil(image_shape[1] / stride))]
             for stride in config.BACKBONE_STRIDES])
 
+def compute_backbone_shapes_3D(config, image_shape):
+    """Computes the width, height and depth of each stage of the backbone network.
+
+    Returns:
+        [N, (depth, height, width)]. Where N is the number of stages
+    """
+    if callable(config.BACKBONE):
+        return config.COMPUTE_BACKBONE_SHAPE(image_shape)
+
+    # Currently supports ResNet only
+    assert config.BACKBONE in ["resnet50", "resnet101"]
+    return np.array(
+        [[int(math.ceil(image_shape[0] / stride)),
+            int(math.ceil(image_shape[1] / stride)),
+            int(math.ceil(image_shape[2] / stride))]
+            for stride in config.BACKBONE_STRIDES])
+
 
 ############################################################
 #  Resnet Graph
@@ -1552,6 +1569,123 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
 
     return rpn_match, rpn_bbox
 
+def build_rpn_targets_3D(image_shape, anchors, gt_class_ids, gt_boxes, config):
+    """Given the anchors and GT boxes, compute overlaps and identify positive
+    anchors and deltas to refine them to match their corresponding GT boxes.
+
+    anchors: [num_anchors, (z1, y1, x1, z2, y2, x2)]
+    gt_class_ids: [num_gt_boxes] Integer class IDs.
+    gt_boxes: [num_gt_boxes, (z1, y1, x1, z2, y2, x2)]
+
+    Returns:
+    rpn_match: [N] (int32) matches between anchors and GT boxes.
+               1 = positive anchor, -1 = negative anchor, 0 = neutral
+    rpn_bbox: [N, (dz, dy, dx, log(dd), log(dh), log(dw))] Anchor bbox deltas.
+    """
+    # RPN Match: 1 = positive anchor, -1 = negative anchor, 0 = neutral
+    rpn_match = np.zeros([anchors.shape[0]], dtype=np.int32)
+    # RPN bounding boxes: [max anchors per image, (dy, dx, log(dh), log(dw))]
+    rpn_bbox = np.zeros((config.RPN_TRAIN_ANCHORS_PER_IMAGE, 6))
+
+    # Handle COCO crowds
+    # A crowd box in COCO is a bounding box around several instances. Exclude
+    # them from training. A crowd box is given a negative class ID.
+    crowd_ix = np.where(gt_class_ids < 0)[0]
+    # NOTE 3D: this isn't modified, it shouldn't matter for us
+    if crowd_ix.shape[0] > 0:
+        # Filter out crowds from ground truth class IDs and boxes
+        non_crowd_ix = np.where(gt_class_ids > 0)[0]
+        crowd_boxes = gt_boxes[crowd_ix]
+        gt_class_ids = gt_class_ids[non_crowd_ix]
+        gt_boxes = gt_boxes[non_crowd_ix]
+        # Compute overlaps with crowd boxes [anchors, crowds]
+        crowd_overlaps = utils.compute_overlaps_3D(anchors, crowd_boxes)
+        crowd_iou_max = np.amax(crowd_overlaps, axis=1)
+        no_crowd_bool = (crowd_iou_max < 0.001)
+    else:
+        # All anchors don't intersect a crowd
+        no_crowd_bool = np.ones([anchors.shape[0]], dtype=bool)
+
+    # Compute overlaps [num_anchors, num_gt_boxes]
+    overlaps = utils.compute_overlaps_3D(anchors, gt_boxes)
+
+    # Match anchors to GT Boxes
+    # If an anchor overlaps a GT box with IoU >= ANCHOR_MAX_IOU then it's positive.
+    # If an anchor overlaps a GT box with IoU < ANCHOR_MIN_IOU then it's negative.
+    # Neutral anchors are those that don't match the conditions above,
+    # and they don't influence the loss function.
+    # However, don't keep any GT box unmatched (rare, but happens). Instead,
+    # match it to the closest anchor (even if its max IoU is < ANCHOR_MIN_IOU).
+    #
+    # 1. Set negative anchors first. They get overwritten below if a GT box is
+    # matched to them. Skip boxes in crowd areas.
+    anchor_iou_argmax = np.argmax(overlaps, axis=1)
+    anchor_iou_max = overlaps[np.arange(overlaps.shape[0]), anchor_iou_argmax]
+    rpn_match[(anchor_iou_max < config.ANCHOR_MIN_IOU) & (no_crowd_bool)] = -1
+    # 2. Set an anchor for each GT box (regardless of IoU value).
+    # If multiple anchors have the same IoU match all of them
+    gt_iou_argmax = np.argwhere(overlaps == np.max(overlaps, axis=0))[:,0]
+    rpn_match[gt_iou_argmax] = 1
+    # 3. Set anchors with high overlap as positive.
+    rpn_match[anchor_iou_max >= config.ANCHOR_MAX_IOU] = 1
+
+    # Subsample to balance positive and negative anchors
+    # Don't let positives be more than half the anchors
+    ids = np.where(rpn_match == 1)[0]
+    extra = len(ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE // 2)
+    if extra > 0:
+        # Reset the extra ones to neutral
+        ids = np.random.choice(ids, extra, replace=False)
+        rpn_match[ids] = 0
+    # Same for negative proposals
+    ids = np.where(rpn_match == -1)[0]
+    extra = len(ids) - (config.RPN_TRAIN_ANCHORS_PER_IMAGE -
+                        np.sum(rpn_match == 1))
+    if extra > 0:
+        # Rest the extra ones to neutral
+        ids = np.random.choice(ids, extra, replace=False)
+        rpn_match[ids] = 0
+
+    # For positive anchors, compute shift and scale needed to transform them
+    # to match the corresponding GT boxes.
+    ids = np.where(rpn_match == 1)[0]
+    ix = 0  # index into rpn_bbox
+    # TODO: use box_refinement() rather than duplicating the code here
+    for i, a in zip(ids, anchors[ids]):
+        # Closest gt box (it might have IoU < 0.7)
+        gt = gt_boxes[anchor_iou_argmax[i]]
+
+        # Convert coordinates to center plus width/height.
+        # GT Box
+        gt_d = gt[3] - gt[0]
+        gt_h = gt[4] - gt[1]
+        gt_w = gt[5] - gt[2]
+        gt_center_z = gt[0] + 0.5 * gt_d
+        gt_center_y = gt[1] + 0.5 * gt_h
+        gt_center_x = gt[2] + 0.5 * gt_w
+        # Anchor
+        a_d = a[3] - a[0]
+        a_h = a[4] - a[1]
+        a_w = a[5] - a[2]
+        a_center_z = a[0] + 0.5 * a_d
+        a_center_y = a[1] + 0.5 * a_h
+        a_center_x = a[2] + 0.5 * a_w
+
+        # Compute the bbox refinement that the RPN should predict.
+        rpn_bbox[ix] = [
+            (gt_center_z - a_center_z) / a_d,
+            (gt_center_y - a_center_y) / a_h,
+            (gt_center_x - a_center_x) / a_w,
+            np.log(gt_d / a_d),
+            np.log(gt_h / a_h),
+            np.log(gt_w / a_w)
+        ]
+        # Normalize
+        rpn_bbox[ix] /= config.RPN_BBOX_STD_DEV
+        ix += 1
+
+    return rpn_match, rpn_bbox
+
 
 def generate_random_rois(image_shape, count, gt_class_ids, gt_boxes):
     """Generates ROI proposals similar to what a region proposal network
@@ -2746,6 +2880,30 @@ def compose_image_meta(image_id, original_image_shape, image_shape,
     )
     return meta
 
+def compose_image_meta_3D(image_id, original_image_shape, image_shape,
+                       window, scale, active_class_ids):
+    """Takes attributes of an image and puts them in one 1D array.
+
+    image_id: An int ID of the image. Useful for debugging.
+    original_image_shape: [D, H, W] before resizing or padding.
+    image_shape: [D, H, W] after resizing and padding
+    window: (z1, y1, x1, z2, y2, x2) in pixels. The area of the image where the real
+            image is (excluding the padding)
+    scale: The scaling factor applied to the original image (float32)
+    active_class_ids: List of class_ids available in the dataset from which
+        the image came. Useful if training on images from multiple datasets
+        where not all classes are present in all datasets.
+    """
+    meta = np.array(
+        [image_id] +                  # size=1
+        list(original_image_shape) +  # size=3
+        list(image_shape) +           # size=3
+        list(window) +                # size=6 (z1, y1, x1, z2, y2, x2) in image coordinates
+        [scale] +                     # size=1
+        list(active_class_ids)        # size=num_classes
+    )
+    return meta
+
 
 def parse_image_meta(meta):
     """Parses an array that contains image attributes to its components.
@@ -2770,6 +2928,29 @@ def parse_image_meta(meta):
         "active_class_ids": active_class_ids.astype(np.int32),
     }
 
+def parse_image_meta_3D(meta):
+    """Parses an array that contains image attributes to its components.
+    See compose_image_meta() for more details.
+
+    meta: [batch, meta length] where meta length depends on NUM_CLASSES
+
+    Returns a dict of the parsed values.
+    """
+    image_id = meta[:, 0]
+    original_image_shape = meta[:, 1:4]
+    image_shape = meta[:, 4:7]
+    window = meta[:, 7:13]  # (z1, y1, x1, z2, y2, x2) window of image in in pixels
+    scale = meta[:, 13]
+    active_class_ids = meta[:, 14:]
+    return {
+        "image_id": image_id.astype(np.int32),
+        "original_image_shape": original_image_shape.astype(np.int32),
+        "image_shape": image_shape.astype(np.int32),
+        "window": window.astype(np.int32),
+        "scale": scale.astype(np.float32),
+        "active_class_ids": active_class_ids.astype(np.int32),
+    }
+
 
 def parse_image_meta_graph(meta):
     """Parses a tensor that contains image attributes to its components.
@@ -2785,6 +2966,29 @@ def parse_image_meta_graph(meta):
     window = meta[:, 7:11]  # (y1, x1, y2, x2) window of image in in pixels
     scale = meta[:, 11]
     active_class_ids = meta[:, 12:]
+    return {
+        "image_id": image_id,
+        "original_image_shape": original_image_shape,
+        "image_shape": image_shape,
+        "window": window,
+        "scale": scale,
+        "active_class_ids": active_class_ids,
+    }
+
+def parse_image_meta_graph_3D(meta):
+    """Parses a tensor that contains image attributes to its components.
+    See compose_image_meta() for more details.
+
+    meta: [batch, meta length] where meta length depends on NUM_CLASSES
+
+    Returns a dict of the parsed tensors.
+    """
+    image_id = meta[:, 0]
+    original_image_shape = meta[:, 1:4]
+    image_shape = meta[:, 4:7]
+    window = meta[:, 7:13]  # (z1, y1, x1, z2, y2, x2) window of image in in pixels
+    scale = meta[:, 13]
+    active_class_ids = meta[:, 14:]
     return {
         "image_id": image_id,
         "original_image_shape": original_image_shape,

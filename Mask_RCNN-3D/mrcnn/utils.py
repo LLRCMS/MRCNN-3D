@@ -955,6 +955,25 @@ def minimize_mask(bbox, mask, mini_shape):
         mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
+def minimize_mask_3D(bbox, mask, mini_shape):
+    """Resize masks to a smaller version to reduce memory load.
+    Mini-masks can be resized back to image scale using expand_masks_3D()
+
+    See inspect_data.ipynb notebook for more details.
+    """
+    mini_mask = np.zeros(mini_shape + (mask.shape[-1],), dtype=bool)
+    for i in range(mask.shape[-1]):
+        # Pick slice and cast to bool in case load_mask() returned wrong dtype
+        m = mask[:, :, :, i].astype(bool)
+        z1, y1, x1, z2, y2, x2 = bbox[i][:6]
+        m = m[z1:z2, y1:y2, x1:x2]
+        if m.size == 0:
+            raise Exception("Invalid bounding box with area of zero")
+        # Resize with bilinear interpolation
+        m = resize(m, mini_shape)
+        mini_mask[:, :, :, i] = np.around(m).astype(np.bool)
+    return mini_mask
+
 
 def expand_mask(bbox, mini_mask, image_shape):
     """Resizes mini masks back to image size. Reverses the change
@@ -971,6 +990,24 @@ def expand_mask(bbox, mini_mask, image_shape):
         # Resize with bilinear interpolation
         m = resize(m, (h, w))
         mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
+    return mask
+
+def expand_mask_3D(bbox, mini_mask, image_shape):
+    """Resizes mini masks back to image size. Reverses the change
+    of minimize_mask_3D().
+
+    See inspect_data.ipynb notebook for more details.
+    """
+    mask = np.zeros(image_shape[:3] + (mini_mask.shape[-1],), dtype=bool)
+    for i in range(mask.shape[-1]):
+        m = mini_mask[:, :, :, i]
+        z1, y1, x1, z2, y2, x2 = bbox[i][:6]
+        d = z2 - z1
+        h = y2 - y1
+        w = x2 - x1
+        # Resize with bilinear interpolation
+        m = resize(m, (d, h, w))
+        mask[z1:z2, y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
     return mask
 
 
@@ -1040,6 +1077,50 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
                             box_centers + 0.5 * box_sizes], axis=1)
     return boxes
 
+def generate_anchors_3D(scales, ratios_xy, ratios_xz, shape, feature_stride, anchor_stride):
+    """
+    scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
+    ratios_xy: 1D array of anchor ratios of width/height. Example: [0.5, 1, 2]
+    ratios_xz: 1D array of anchor ratios of width/depth. Example: [0.5, 1, 2]
+    shape: [depth, eight, width] spatial shape of the feature map over which
+            to generate anchors.
+    feature_stride: Stride of the feature map relative to the image in pixels.
+    anchor_stride: Stride of anchors on the feature map. For example, if the
+        value is 2 then generate anchors for every other feature map pixel.
+    """
+    # Get all combinations of scales and ratios
+    scales, ratios_xy, ratios_xz = np.meshgrid(np.array(scales), np.array(ratios_xy), np.array(ratios_xz))
+    scales = scales.flatten()
+    ratios_xy = ratios_xy.flatten()
+    ratios_xz = ratios_xz.flatten()
+
+    # Enumerate depths, heights and widths from scales and the 2 ratios
+    depths = scales * np.sqrt(ratios_xz)
+    heights = scales / np.sqrt(ratios_xy)
+    widths = scales * np.sqrt(ratios_xy)
+
+    # Enumerate shifts in feature space
+    shifts_z = np.arange(0, shape[0], anchor_stride) * feature_stride
+    shifts_y = np.arange(0, shape[1], anchor_stride) * feature_stride
+    shifts_x = np.arange(0, shape[2], anchor_stride) * feature_stride
+    shifts_x, shifts_y, shifts_z = np.meshgrid(shifts_x, shifts_y, shifts_z)
+
+    # Enumerate combinations of shifts, widths, heights and depths
+    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+    box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
+    box_depths, box_centers_z = np.meshgrid(depths, shifts_z)
+
+    # Reshape to get a list of (z, y, x) and a list of (d, h, w)
+    box_centers = np.stack(
+        [box_centers_z, box_centers_y, box_centers_x], axis=2).reshape([-1, 3])
+    box_sizes = np.stack([box_depths, box_heights, box_widths], axis=2).reshape([-1, 3])
+
+    # Convert to corner coordinates (z1, y1, x1, z2, y2, x2)
+    boxes = np.concatenate([box_centers - 0.5 * box_sizes,
+                            box_centers + 0.5 * box_sizes], axis=1)
+
+    return boxes
+
 
 def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides,
                              anchor_stride):
@@ -1057,6 +1138,25 @@ def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides,
     anchors = []
     for i in range(len(scales)):
         anchors.append(generate_anchors(scales[i], ratios, feature_shapes[i],
+                                        feature_strides[i], anchor_stride))
+    return np.concatenate(anchors, axis=0)
+
+def generate_pyramid_anchors_3D(scales, ratios_xy, ratios_xz, feature_shapes, feature_strides,
+                             anchor_stride):
+    """Generate anchors at different levels of a feature pyramid. Each scale
+    is associated with a level of the pyramid, but each ratio is used in
+    all levels of the pyramid.
+
+    Returns:
+    anchors: [N, (z1, y1, x1, z2, y2, x2)]. All generated anchors in one array. Sorted
+        with the same order of the given scales. So, anchors of scale[0] come
+        first, then anchors of scale[1], and so on.
+    """
+    # Anchors
+    # [anchor_count, (z1, y1, x1, z2, y2, x2)]
+    anchors = []
+    for i in range(len(scales)):
+        anchors.append(generate_anchors_3D(scales[i], ratios_xy, ratios_xz, feature_shapes[i],
                                         feature_strides[i], anchor_stride))
     return np.concatenate(anchors, axis=0)
 

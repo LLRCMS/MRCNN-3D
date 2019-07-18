@@ -76,8 +76,12 @@ class Config(object):
     RPN_ANCHOR_SCALES = (32, 64, 128, 256, 512)
 
     # Ratios of anchors at each cell (width/height)
-    # A value of 1 represents a square anchor, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS = [0.5, 1, 2]
+    # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
+    RPN_ANCHOR_RATIOS_XY = [0.5, 1, 2]
+
+    # Ratios of anchors at each cell (width/depth)
+    # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
+    RPN_ANCHOR_RATIOS_XZ = [0.5, 1, 2]
 
     # Anchor stride
     # If 1 then anchors are created for each cell in the backbone feature map.
@@ -101,7 +105,7 @@ class Config(object):
     # If enabled, resizes instance masks to a smaller size to reduce
     # memory load. Recommended when using high-resolution images.
     USE_MINI_MASK = True
-    MINI_MASK_SHAPE = (56, 56)  # (height, width) of the mini-mask
+    MINI_MASK_SHAPE = (56, 56, 56)  # (height, width) of the mini-mask
 
     # Input image resizing
     # Generally, use the "square" resizing mode for training and predicting
@@ -123,7 +127,7 @@ class Config(object):
     #         on IMAGE_MIN_DIM and IMAGE_MIN_SCALE, then picks a random crop of
     #         size IMAGE_MIN_DIM x IMAGE_MIN_DIM. Can be used in training only.
     #         IMAGE_MAX_DIM is not used in this mode.
-    IMAGE_RESIZE_MODE = "square"
+    IMAGE_RESIZE_MODE = "cube"
     IMAGE_MIN_DIM = 800
     IMAGE_MAX_DIM = 1024
     # Minimum scaling ratio. Checked after MIN_IMAGE_DIM and can force further
@@ -149,20 +153,27 @@ class Config(object):
     # Percent of positive ROIs used to train classifier/mask heads
     ROI_POSITIVE_RATIO = 0.33
 
+    # cutoff iou point for anchors
+    # A anchor needs to have maximum ANCHOR_MAX_IOU to be considered negative
+    ANCHOR_MAX_IOU = 0.3
+
+    # An anchor needs to have minimum ANCHOR_MIN_IOU to be considered positive
+    ANCHOR_MIN_IOU = 0.7
+
     # Pooled ROIs
     POOL_SIZE = 7
     MASK_POOL_SIZE = 14
 
     # Shape of output mask
     # To change this you also need to change the neural network mask branch
-    MASK_SHAPE = [28, 28]
+    MASK_SHAPE = [28, 28, 28]
 
     # Maximum number of ground truth instances to use in one image
     MAX_GT_INSTANCES = 100
 
     # Bounding box refinement standard deviation for RPN and final detections.
-    RPN_BBOX_STD_DEV = np.array([0.1, 0.1, 0.2, 0.2])
-    BBOX_STD_DEV = np.array([0.1, 0.1, 0.2, 0.2])
+    RPN_BBOX_STD_DEV = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2])
+    BBOX_STD_DEV = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]) 
 
     # Max number of final detections
     DETECTION_MAX_INSTANCES = 100
@@ -217,15 +228,15 @@ class Config(object):
 
         # Input image size
         if self.IMAGE_RESIZE_MODE == "crop":
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
                 self.IMAGE_CHANNEL_COUNT])
         else:
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
+            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
                 self.IMAGE_CHANNEL_COUNT])
 
         # Image meta data length
         # See compose_image_meta() for details
-        self.IMAGE_META_SIZE = 1 + 3 + 3 + 4 + 1 + self.NUM_CLASSES
+        self.IMAGE_META_SIZE = 1 + 3 + 3 + 6 + 1 + self.NUM_CLASSES
 
     def display(self):
         """Display Configuration values."""

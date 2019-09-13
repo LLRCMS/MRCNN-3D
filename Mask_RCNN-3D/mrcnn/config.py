@@ -77,11 +77,15 @@ class Config(object):
 
     # Ratios of anchors at each cell (width/height)
     # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS_XY = [0.5, 1, 2]
+    # GG Not used
+    # RPN_ANCHOR_RATIOS_XY = [0.5, 1, 2]
 
     # Ratios of anchors at each cell (width/depth)
     # A value of 1 represents a square anchor in the xy plane, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS_XZ = [0.5, 1, 2]
+    # GG not used
+    #  RPN_ANCHOR_RATIOS_XZ = [0.5, 1, 2]
+    # GG Only one ratio : (XY)*Z
+    RPN_ANCHOR_RATIOS = [0.5, 1, 2]
 
     # Anchor stride
     # If 1 then anchors are created for each cell in the backbone feature map.
